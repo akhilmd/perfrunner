@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import cached_property
 from itertools import chain, combinations, permutations
-from typing import Any, Iterable, Iterator, Optional, Tuple
+from typing import Any, Iterable, Iterator, NamedTuple, Optional, Tuple
 from uuid import uuid4
 
 from decorator import decorator
@@ -2462,6 +2462,90 @@ class ViewsSettings:
         return str(self.__dict__)
 
 
+class VectorScanPoint(NamedTuple):
+    """The query-time knobs of one vector scan phase, i.e. one point on a recall/QPS curve.
+
+    ``rerank`` and ``topn_scan`` are None when the point does not pin them, which means
+    "whatever this test would have used anyway": the test's ``vector_reranking`` and the
+    indexer's ``bhive.topNScan``. A point that pins nothing therefore reproduces exactly
+    the single-operating-point behaviour vector tests had before sweeps existed.
+    """
+
+    nprobes: int
+    rerank: Optional[bool] = None
+    topn_scan: Optional[int] = None
+
+    @classmethod
+    def parse(cls, token: str) -> "VectorScanPoint":
+        """Parse one ``nprobes[:rerank[:topNScan]]`` token, e.g. ``100``, ``100:false:80``."""
+        fields = [field.strip() for field in token.split(':')]
+        if len(fields) > 3:
+            raise ValueError(f"Invalid vector scan point {token!r}: "
+                             "expected nprobes[:rerank[:topNScan]]")
+
+        rerank = None
+        if len(fields) > 1 and fields[1]:
+            if fields[1].lower() not in ('true', 'false'):
+                raise ValueError(f"Invalid rerank value {fields[1]!r} in vector scan point "
+                                 f"{token!r}: expected true or false")
+            rerank = fields[1].lower() == 'true'
+
+        topn_scan = int(fields[2]) if len(fields) > 2 and fields[2] else None
+
+        return cls(nprobes=int(fields[0]), rerank=rerank, topn_scan=topn_scan)
+
+    @property
+    def label(self) -> str:
+        """Identify the point in metric ids and titles.
+
+        A point that pins nothing but nprobes labels as the bare number, so the metric ids
+        of tests that scan at a single operating point do not change.
+        """
+        label = str(self.nprobes)
+        if self.rerank is not None:
+            label += '_rerank' if self.rerank else '_norerank'
+        if self.topn_scan is not None:
+            label += f'_topn{self.topn_scan}'
+        return label
+
+    @property
+    def knobs(self) -> str:
+        """Describe the point in prose, for KPI titles."""
+        knobs = [f"probes-{self.nprobes}"]
+        if self.rerank is not None:
+            knobs.append("rerank on" if self.rerank else "rerank off")
+        if self.topn_scan is not None:
+            knobs.append(f"topNScan {self.topn_scan}")
+        return ', '.join(knobs)
+
+    def ann_args(self, default_rerank: Optional[bool] = None) -> str:
+        """Render the ANN_DISTANCE arguments that follow the similarity metric.
+
+        ANN_DISTANCE reads them positionally as (nprobes, rerank, topNScan), so a point
+        that pins topNScan has to render a rerank argument as well. ``default_rerank`` is
+        the value to use when the point does not pin one; None means "do not pass rerank
+        at all", which the query service reads as rerank off.
+        """
+        rerank = default_rerank if self.rerank is None else self.rerank
+        args = [str(self.nprobes)]
+        if rerank is not None or self.topn_scan is not None:
+            args.append(str(bool(rerank)).lower())
+        if self.topn_scan is not None:
+            args.append(str(self.topn_scan))
+        return ', '.join(args)
+
+
+def parse_vector_scan_points(scan_probes: Any) -> list[VectorScanPoint]:
+    """Parse ``vector_scan_probes`` into one operating point per vector scan phase.
+
+    The option has always been a comma-separated list of probe counts for the recall check;
+    each element may now also pin the other two query-time knobs as ``nprobes:rerank:topNScan``.
+    """
+    if not scan_probes:
+        return []
+    return [VectorScanPoint.parse(token) for token in str(scan_probes).split(',') if token.strip()]
+
+
 class GSISettings:
 
     CBINDEXPERF_CONFIGFILE = ''
@@ -2534,6 +2618,9 @@ class GSISettings:
         self.vector_nprobes = options.get("nprobes", self.DEFAULT_NPROBES)
         self.vector_filter_percentage = options.get("vector_filter_percentage", 0)
         self.vector_scan_probes = options.get("vector_scan_probes", 0)
+        # One scan phase per point. Tests that set a single probe count get a single
+        # point, and so behave exactly as they did before sweeps existed.
+        self.vector_scan_points = parse_vector_scan_points(self.vector_scan_probes)
         self.vector_def_prefix = options.get("vector_def_prefix", None)
         self.num_index_replica = options.get("num_index_replica", None)
         self.include_columns = options.get("include_columns", None)

@@ -33,7 +33,12 @@ from perfrunner.helpers.local_stats import (
 )
 from perfrunner.helpers.misc import SSLCertificate, parse_duration_to_secs, pretty_dict
 from perfrunner.remote import api, executor
-from perfrunner.settings import ClusterSpec, TestConfig
+from perfrunner.settings import (
+    ClusterSpec,
+    TestConfig,
+    VectorScanPoint,
+    parse_vector_scan_points,
+)
 from perfrunner.workloads.analytics.bigfun.query_gen import new_queries
 from perfrunner.workloads.tcmalloc import KeyValueIterator, LargeIterator
 from spring import docgen
@@ -50,6 +55,7 @@ from perfrunner.helpers.worker import (  # noqa: E402
     RemoteWorkerManager,
     store_pid,
 )
+from perfrunner.tests import n1ql as n1ql_tests  # noqa: E402
 
 sdk_major_version = int(importlib.metadata.version("couchbase")[0])
 if sdk_major_version == 2:
@@ -195,6 +201,162 @@ class SettingsTest(TestCase):
             test_config.parse(file)
             self.assertEqual(test_config.showfast.category, 'benchmark_kv')
             self.assertEqual(test_config.showfast.sub_category, 'Throughput')
+
+
+class VectorScanPointTest(TestCase):
+
+    """`vector_scan_probes` tokens, which name one vector scan phase each.
+
+    ANN_DISTANCE reads its knobs positionally as (nprobes, rerank, topNScan), so what a
+    point renders has to line up with which knobs it pins.
+    """
+
+    def test_a_bare_probe_count_pins_nothing_else(self):
+        point = VectorScanPoint.parse('25')
+        self.assertEqual(point, VectorScanPoint(nprobes=25, rerank=None, topn_scan=None))
+
+    def test_a_token_can_pin_rerank_and_topn_scan(self):
+        self.assertEqual(VectorScanPoint.parse('100:false'),
+                         VectorScanPoint(nprobes=100, rerank=False))
+        self.assertEqual(VectorScanPoint.parse('100:true:80'),
+                         VectorScanPoint(nprobes=100, rerank=True, topn_scan=80))
+
+    def test_a_token_can_pin_topn_scan_alone(self):
+        self.assertEqual(VectorScanPoint.parse('100::80'),
+                         VectorScanPoint(nprobes=100, rerank=None, topn_scan=80))
+
+    def test_tokens_tolerate_surrounding_whitespace(self):
+        self.assertEqual(VectorScanPoint.parse(' 100 : false '),
+                         VectorScanPoint(nprobes=100, rerank=False))
+
+    def test_a_malformed_token_is_rejected_rather_than_silently_scanned(self):
+        for token in ('', 'ten', '10:maybe', '10:true:80:5', '10:true:many'):
+            with self.assertRaises(ValueError, msg=token):
+                VectorScanPoint.parse(token)
+
+    def test_a_bare_probe_count_labels_as_itself(self):
+        """The label goes into metric ids, so a single-point test keeps its showfast series."""
+        self.assertEqual(VectorScanPoint.parse('25').label, '25')
+
+    def test_pinned_knobs_are_named_in_the_label(self):
+        self.assertEqual(VectorScanPoint.parse('100:false').label, '100_norerank')
+        self.assertEqual(VectorScanPoint.parse('100:true').label, '100_rerank')
+        self.assertEqual(VectorScanPoint.parse('100:true:80').label, '100_rerank_topn80')
+        self.assertEqual(VectorScanPoint.parse('100::80').label, '100_topn80')
+
+    def test_knobs_read_as_prose_for_kpi_titles(self):
+        self.assertEqual(VectorScanPoint.parse('100:false:80').knobs,
+                         'probes-100, rerank off, topNScan 80')
+
+    def test_an_unpinned_point_renders_only_the_default_it_is_given(self):
+        point = VectorScanPoint.parse('25')
+        self.assertEqual(point.ann_args(), '25')
+        self.assertEqual(point.ann_args(default_rerank=True), '25, true')
+        self.assertEqual(point.ann_args(default_rerank=False), '25, false')
+
+    def test_a_pinned_point_overrides_the_default(self):
+        self.assertEqual(VectorScanPoint.parse('25:false').ann_args(default_rerank=True),
+                         '25, false')
+
+    def test_pinning_topn_scan_forces_a_rerank_argument(self):
+        """The topNScan knob is 6th positional, so it cannot be passed without rerank."""
+        self.assertEqual(VectorScanPoint.parse('25::80').ann_args(), '25, false, 80')
+        self.assertEqual(VectorScanPoint.parse('25::80').ann_args(default_rerank=True),
+                         '25, true, 80')
+
+    def test_a_list_becomes_one_point_per_scan_phase(self):
+        self.assertEqual(parse_vector_scan_points('25,50,100:false'),
+                         [VectorScanPoint(25), VectorScanPoint(50),
+                          VectorScanPoint(100, rerank=False)])
+
+    def test_an_unset_option_yields_no_points(self):
+        for unset in (0, '', None):
+            self.assertEqual(parse_vector_scan_points(unset), [])
+
+    def test_a_point_list_survives_a_jenkins_override(self):
+        """Overrides are split on dots, so the commas and colons of a point list pass through.
+
+        This is how a run is re-pointed at a different sweep without a new commit.
+        """
+        test_config = TestConfig()
+        test_config.parse(
+            'tests/n1ql/n1ql_Vector_Latency_throughput_Prepared_statements_100M_128dim_Bhive.test',
+            override=['secondary.vector_scan_probes.33,66::100,66:false'])
+        self.assertEqual([p.label for p in test_config.gsi_settings.vector_scan_points],
+                         ['33', '66_topn100', '66_norerank'])
+
+    def test_existing_configs_keep_the_metric_ids_they_report_today(self):
+        """A plain probe count must label as itself in every .test file that uses one.
+
+        The label is what goes into the recall/latency/throughput metric ids, so any drift
+        here silently starts a new showfast series for an existing test.
+        """
+        drifted = []
+        for file_name in sorted(glob.glob('tests/**/*.test', recursive=True)):
+            test_config = TestConfig()
+            test_config.parse(file_name)
+            probes = test_config.gsi_settings.vector_scan_probes
+            if not probes or ':' in str(probes):
+                continue
+            labels = [p.label for p in test_config.gsi_settings.vector_scan_points]
+            expected = [token.strip() for token in str(probes).split(',') if token.strip()]
+            if labels != expected:
+                drifted.append(f'{file_name}: {labels} != {expected}')
+        self.assertEqual(drifted, [], f'{len(drifted)} config(s) changed metric ids')
+
+
+class VectorScanRenderTest(TestCase):
+
+    """Filling a query template's ANN_DISTANCE placeholders for one scan phase."""
+
+    def render(self, statement, point, reranking=True, index_type='bhive', explicit=False):
+        test = object.__new__(n1ql_tests.N1qlVectorLatencyThroughputPreparedStatementTest)
+        test.index_type = index_type
+        test.test_config = SimpleNamespace(
+            gsi_settings=SimpleNamespace(vector_reranking=reranking,
+                                         vector_reranking_explicit=explicit)
+        )
+        return test.render_ann_knobs(statement, point)
+
+    TEMPLATE = "ORDER BY ANN_DISTANCE(emb, $1, 'L2', NPROBES, RERANKING) limit 10"
+    BARE = "ORDER BY ANN_DISTANCE(emb, $1, 'L2', NPROBES) limit 10"
+
+    def test_a_template_with_a_rerank_placeholder_gets_the_tests_rerank_setting(self):
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, true)",
+                      self.render(self.TEMPLATE, VectorScanPoint(25)))
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, false)",
+                      self.render(self.TEMPLATE, VectorScanPoint(25), reranking=False))
+
+    def test_a_point_overrides_the_tests_rerank_setting(self):
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, false)",
+                      self.render(self.TEMPLATE, VectorScanPoint(25, rerank=False)))
+
+    def test_topn_scan_renders_after_rerank(self):
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, true, 80)",
+                      self.render(self.TEMPLATE, VectorScanPoint(25, topn_scan=80)))
+
+    def test_a_template_without_a_rerank_placeholder_stays_without_one(self):
+        """Such a template asks for the query service default, which is rerank off."""
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25)",
+                      self.render(self.BARE, VectorScanPoint(25)))
+
+    def test_a_template_without_a_rerank_placeholder_still_honours_a_pinned_knob(self):
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, true)",
+                      self.render(self.BARE, VectorScanPoint(25, rerank=True)))
+        self.assertIn("ANN_DISTANCE(emb, $1, 'L2', 25, false, 80)",
+                      self.render(self.BARE, VectorScanPoint(25, topn_scan=80)))
+
+    def test_rerank_is_only_defaulted_on_for_bhive(self):
+        """Reranking needs the full vectors bhive persists; other indexes must not ask."""
+        test = object.__new__(n1ql_tests.N1qlVectorLatencyThroughputPreparedStatementTest)
+        test.index_type = 'composite'
+        test.test_config = SimpleNamespace(
+            gsi_settings=SimpleNamespace(vector_reranking=True,
+                                         vector_reranking_explicit=False)
+        )
+        self.assertIsNone(test.default_rerank)
+        test.index_type = 'bhive'
+        self.assertTrue(test.default_rerank)
 
 
 class MiscTest(TestCase):

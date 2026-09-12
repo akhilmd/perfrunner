@@ -59,7 +59,14 @@ top_k_results = 10
 
 [secondary]
 indexer.settings.storage_mode = plasma
-vector_scan_probes = 25
+# One scan phase per point, to report QPS and latency against recall rather than at a
+# single operating point. Each point is nprobes[:rerank[:topNScan]]; an unpinned rerank
+# is the test's vector_reranking (on), an unpinned topNScan is the indexer default (40).
+# The first point keeps the test's original metric ids, so leave 25 in front.
+# Sweeps: nprobes at default topNScan; topNScan at default nprobes; two combinations;
+# rerank off at two nprobes (full vectors are persisted by default, so no rebuild needed).
+# Override from Jenkins with e.g. secondary.vector_scan_probes.25,50,100::80
+vector_scan_probes = 25,5,10,50,100,200,25::10,25::20,25::80,25::160,100::80,200::80,25:false,100:false
 indexes = tests/gsi/index_defs/1bucket_1scope_1collections_1_vector_index_default.json
 vector_dimension = 128
 override_index_def = emb Vector

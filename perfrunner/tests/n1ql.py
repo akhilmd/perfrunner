@@ -12,7 +12,7 @@ from perfrunner.helpers import local
 from perfrunner.helpers.cbmonitor import timeit, with_stats
 from perfrunner.helpers.misc import create_build_tuple, pretty_dict, run_aws_cli_command
 from perfrunner.helpers.profiler import with_profiles
-from perfrunner.settings import AccessSettings
+from perfrunner.settings import AccessSettings, VectorScanPoint
 from perfrunner.tests import PerfTest, TargetIterator
 from perfrunner.tests.rebalance import (
     CapellaRebalanceTest,
@@ -1947,12 +1947,25 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
         )
         self.wait_for_persistence()
 
+    @property
+    def default_rerank(self) -> Optional[bool]:
+        """Return the rerank argument to pass when a scan point does not pin one.
+
+        None means "do not pass rerank at all", which the query service reads as rerank
+        off. Reranking is only meaningful for bhive, so it is passed for bhive indexes and
+        for any other index whose .test file asked for it explicitly.
+        """
+        gsi_settings = self.test_config.gsi_settings
+        if self.index_type == "bhive" or gsi_settings.vector_reranking_explicit:
+            return gsi_settings.vector_reranking
+        return None
+
     def vector_recall_and_accuracy_check(self):
         """
         Evaluate vector search recall and accuracy.
 
-        Calculate recall and accuracy metrics for different probe values
-        against ground‑truth data.
+        Calculate recall and accuracy metrics for each vector scan point (a probe count
+        and optionally the other query-time knobs) against ground‑truth data.
         """
         # Setup: Get configuration and test parameters
         query_node = self.query_nodes[0]
@@ -1960,7 +1973,7 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
         index_settings = self.test_config.index_settings
         query_map = index_settings.vector_query_map
         indexes = gsi_settings.indexes
-        probes = gsi_settings.vector_scan_probes.split(",")
+        points = gsi_settings.vector_scan_points
 
         # Load ground truth data: expected results for each query
         ground_truth = [x.split() for x in
@@ -1983,19 +1996,20 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
         collection, _ = next(iter(collections.items()))
         similarity = f"'{gsi_settings.vector_similarity}'"
         index_def_prefix = gsi_settings.include_columns or gsi_settings.index_def_prefix
-        def process_query(vector, truth, probe, is_first_query):
+        def process_query(vector, truth, point, is_first_query):
             """
             Process a single vector query and calculate recall/accuracy metrics.
 
             Args:
                 vector: Input vector query string
                 truth: Expected ground truth results
-                probe: Number of probes to use for the search
+                point: Scan point whose query-time knobs this query is measured at
                 is_first_query: Whether this is the first query (for logging)
 
             Returns:
                 tuple: (recall_score, accuracy_score)
             """
+            ann_args = point.ann_args(self.default_rerank)
             # Extract index configuration from the nested structure
             # Parse the vector query (skip first 2 elements, get numeric values)
             # Build the N1QL query statement based on filter configuration
@@ -2007,14 +2021,14 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
                     f"SELECT meta().id FROM `{bucket}`.`{scope}`.`{collection}` "
                     f"WHERE {index_def_prefix} < {threshold} "
                     f"ORDER BY ANN_DISTANCE({gsi_settings.vector_def_prefix}, {query}, "
-                    f"{similarity}, {probe}) LIMIT {k}"
+                    f"{similarity}, {ann_args}) LIMIT {k}"
                 )
             elif not index_def_prefix:
                 # No filter, pure vector search
                 query_statement = (
                     f"SELECT meta().id FROM `{bucket}`.`{scope}`.`{collection}` "
                     f"ORDER BY ANN_DISTANCE({gsi_settings.vector_def_prefix}, {query}, "
-                    f"{similarity}, {probe}) LIMIT {k}"
+                    f"{similarity}, {ann_args}) LIMIT {k}"
                 )
             else:
                 # Use categorical filter
@@ -2022,17 +2036,9 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
                     f"SELECT meta().id FROM `{bucket}`.`{scope}`.`{collection}` "
                     f"WHERE {index_def_prefix} = 'eligible' "
                     f"ORDER BY ANN_DISTANCE({gsi_settings.vector_def_prefix}, {query}, "
-                    f"{similarity}, {probe}) LIMIT {k}"
+                    f"{similarity}, {ann_args}) LIMIT {k}"
                 )
 
-            # Inject reranking param for bhive, or for any non-bhive index
-            # that explicitly set vector_reranking in its .test file (keeps
-            # existing tests that never declare it unchanged).
-            if self.index_type == "bhive" or gsi_settings.vector_reranking_explicit:
-                query_statement = query_statement.replace(
-                    ") LIMIT",
-                    f", {str(gsi_settings.vector_reranking).lower()}) LIMIT",
-                )
             if gsi_settings.partition_by_clause == "brand":
                 # Special case for brand-based partitioning
                 query_statement = query_statement.replace('eligible', 'q')
@@ -2056,8 +2062,8 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
             acc = int(ids[0] == truth[0]) # Accuracy: exact match of top result
             return common_ids, acc
 
-        # Main evaluation loop: test each probe value
-        for probe in probes:
+        # Main evaluation loop: measure each scan point
+        for point in points:
             recall = []
             accuracy = []
 
@@ -2072,7 +2078,7 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
 
                 # Submit all queries for parallel processing
                 for vector, truth in zip(query_map, ground_truth):
-                    futures.append(executor.submit(process_query, vector, truth, probe,
+                    futures.append(executor.submit(process_query, vector, truth, point,
                                                     is_first_query))
                     is_first_query = False
 
@@ -2082,18 +2088,18 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
                     recall.append(r)
                     accuracy.append(a)
 
-            # Calculate and log average metrics for this probe value
+            # Calculate and log average metrics for this scan point
             accuracy_percentage = np.mean(accuracy) * 100 if accuracy else 0
-            logger.info(f"accuracy percentage for probe {probe}: {accuracy_percentage}")
+            logger.info(f"accuracy percentage for probe {point.label}: {accuracy_percentage}")
             recall_percentage = np.mean(recall) * 100 if recall else 0
-            logger.info(f"recall percentage for probe {probe}: {recall_percentage}")
+            logger.info(f"recall percentage for probe {point.label}: {recall_percentage}")
 
-            # Store results for this probe
+            # Store results for this scan point
             recalls.append(recall_percentage)
             accuracies.append(accuracy_percentage)
 
-        # Return all results: probe values and their corresponding metrics
-        return probes, recalls, accuracies
+        # Return all results: scan points and their corresponding metrics
+        return points, recalls, accuracies
 
     def downloads_ground_truth_file(self):
         ground_truth_s3_path = self.test_config.index_settings.ground_truth_s3_path
@@ -2102,16 +2108,16 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
         f"s3 cp {ground_truth_s3_path+ground_truth_file_name} {ground_truth_file_name}",
         profile = "default")
 
-    def report_kpi(self, probes, recalls, accuracies):
+    def report_kpi(self, points, recalls, accuracies):
         k = int(self.test_config.index_settings.top_k_results)
-        for probe, avg_recall, avg_accuracy in zip(probes, recalls, accuracies):
+        for point, avg_recall, avg_accuracy in zip(points, recalls, accuracies):
             self.reporter.post(
-                *self.metrics.n1ql_vector_recall_and_accuracy(k, probe, avg_recall, "Recall",
-                                                              self.index_type)
+                *self.metrics.n1ql_vector_recall_and_accuracy(k, point.label, avg_recall,
+                                                              "Recall", self.index_type)
                             )
             self.reporter.post(
-                *self.metrics.n1ql_vector_recall_and_accuracy(k, probe, avg_accuracy, "Accuracy",
-                                                              self.index_type)
+                *self.metrics.n1ql_vector_recall_and_accuracy(k, point.label, avg_accuracy,
+                                                              "Accuracy", self.index_type)
                             )
 
     def create_statements(self):
@@ -2187,8 +2193,8 @@ class N1qlVectorSearchTest(N1QLLatencyRawStatementTest):
         index_time = time.time()-start_time
         logger.info(f"index time {index_time}")
         self.downloads_ground_truth_file()
-        probes, recalls, accuracies = self.vector_recall_and_accuracy_check()
-        self.report_kpi(probes, recalls, accuracies)
+        points, recalls, accuracies = self.vector_recall_and_accuracy_check()
+        self.report_kpi(points, recalls, accuracies)
 
 
 class N1qlVectorSearchWithFilterTest(N1qlVectorSearchTest):
@@ -2208,51 +2214,120 @@ class N1qlVectorLatencyThroughputPreparedStatementTest(N1qlVectorSearchTest):
 
     @with_stats
     @with_profiles
-    def access(self):
+    def access(self, point: Optional[VectorScanPoint] = None):
         access_settings = self.test_config.access_settings
         access_settings.workers = 0
-        access_settings = self.set_custom_query_settings(access_settings)
+        if point is None:
+            # Subclasses that override set_custom_query_settings predate scan points and
+            # take only the settings; keep that single-phase call shape for them.
+            access_settings = self.set_custom_query_settings(access_settings)
+        else:
+            access_settings = self.set_custom_query_settings(access_settings, point)
         PerfTest.access(self, settings=access_settings)
 
-    def set_custom_query_settings(self, access_settings: AccessSettings):
-        access_settings.n1ql_queries[0]['statement'] = access_settings.n1ql_queries[0][
-            'statement'].replace("NPROBES", self.test_config.gsi_settings.vector_scan_probes)
-        access_settings.n1ql_queries[0]['statement'] = access_settings.n1ql_queries[0][
-            'statement'].replace("top_k_results", self.test_config.index_settings.top_k_results)
-        access_settings.n1ql_queries[0]['statement'] = access_settings.n1ql_queries[0][
-            'statement'].replace("SIMILARITY", self.test_config.gsi_settings.vector_similarity)
-        access_settings.n1ql_queries[0]['statement'] = access_settings.n1ql_queries[0][
-            'statement'].replace("RERANKING",
-                                 str(self.test_config.gsi_settings.vector_reranking).lower())
+    def first_scan_point(self) -> VectorScanPoint:
+        """Return the scan point to use when a caller does not name one."""
+        points = self.test_config.gsi_settings.vector_scan_points
+        return points[0] if points else VectorScanPoint(nprobes=0)
+
+    def render_ann_knobs(self, statement: str, point: VectorScanPoint) -> str:
+        """Fill a query template's ANN_DISTANCE knob placeholders for one scan point.
+
+        ANN_DISTANCE reads its knobs positionally as (nprobes, rerank, topNScan). Query
+        templates spell the first two as NPROBES and RERANKING, so a point that pins
+        topNScan renders it after the rerank argument.
+
+        A template without a RERANKING placeholder is asking for the query service default
+        (rerank off), so nothing is added there unless the point pins a knob itself. That
+        keeps such a template rendering exactly the probe count it used to.
+        """
+        if "RERANKING" not in statement:
+            return statement.replace("NPROBES", point.ann_args())
+
+        rerank = point.rerank
+        if rerank is None:
+            rerank = self.test_config.gsi_settings.vector_reranking
+        rerank_arg = str(bool(rerank)).lower()
+        if point.topn_scan is not None:
+            rerank_arg = f"{rerank_arg}, {point.topn_scan}"
+        return statement.replace("NPROBES", str(point.nprobes)).replace("RERANKING", rerank_arg)
+
+    def set_custom_query_settings(self, access_settings: AccessSettings,
+                                  point: Optional[VectorScanPoint] = None):
+        point = point or self.first_scan_point()
+        statement = access_settings.n1ql_queries[0]['statement']
+        statement = self.render_ann_knobs(statement, point)
+        statement = statement.replace("top_k_results",
+                                      self.test_config.index_settings.top_k_results)
+        statement = statement.replace("SIMILARITY",
+                                      self.test_config.gsi_settings.vector_similarity)
+        access_settings.n1ql_queries[0]['statement'] = statement
         access_settings.vector_query_map = self.test_config.index_settings.vector_query_map
         return access_settings
 
-    def report_recall_and_accuracy(self, probes, recalls, accuracies):
+    def report_recall_and_accuracy(self, points, recalls, accuracies):
         k = int(self.test_config.index_settings.top_k_results)
-        for probe, avg_recall, avg_accuracy in zip(probes, recalls, accuracies):
+        for point, avg_recall, avg_accuracy in zip(points, recalls, accuracies):
             self.reporter.post(
-                *self.metrics.n1ql_vector_recall_and_accuracy(k, probe, avg_recall, "Recall",
-                                                              self.index_type)
+                *self.metrics.n1ql_vector_recall_and_accuracy(k, point.label, avg_recall,
+                                                              "Recall", self.index_type)
                             )
             self.reporter.post(
-                *self.metrics.n1ql_vector_recall_and_accuracy(k, probe, avg_accuracy, "Accuracy",
-                                                              self.index_type)
+                *self.metrics.n1ql_vector_recall_and_accuracy(k, point.label, avg_accuracy,
+                                                              "Accuracy", self.index_type)
                             )
 
-    def report_kpi(self, probes, recalls, accuracies, initial_throughput):
-        self.report_recall_and_accuracy(probes, recalls, accuracies)
+    def report_scan_point_kpi(self, point: VectorScanPoint, recall: float, accuracy: float,
+                              initial_throughput: float, metric_id_suffix: str) -> dict:
+        """Post the KPIs of one scan phase and return a row for the sweep summary.
+
+        Must be called right after the phase it reports on: the latency KPIs read the data
+        files that phase archived and every KPI is tagged with that phase's cbmonitor
+        snapshot, and both are replaced by the next phase.
+        """
+        title_postfix = self.index_type if not metric_id_suffix \
+            else f"{self.index_type}, {point.knobs}"
+        self.report_recall_and_accuracy([point], [recall], [accuracy])
+
+        row = {'point': point, 'recall': recall, 'accuracy': accuracy}
         for percentile in self.test_config.access_settings.latency_percentiles:
-            self.reporter.post(
-                *self.metrics.query_latency(percentile=percentile,
-                                            custom_title_postfix=self.index_type,
-                                            update_subcategory=True)
-            )
-        self.reporter.post(
-            *self.metrics.avg_n1ql_throughput(self.master_node,
-                                              initial_throughput=initial_throughput,
-                                              custom_title_postfix=self.index_type,
-                                              update_subcategory=True)
-        )
+            metric = self.metrics.query_latency(percentile=percentile,
+                                                custom_title_postfix=title_postfix,
+                                                update_subcategory=True,
+                                                metric_id_suffix=metric_id_suffix)
+            self.reporter.post(*metric)
+            row[f"p{percentile:g}"] = metric[0]
+
+        metric = self.metrics.avg_n1ql_throughput(self.master_node,
+                                                  initial_throughput=initial_throughput,
+                                                  custom_title_postfix=title_postfix,
+                                                  update_subcategory=True,
+                                                  metric_id_suffix=metric_id_suffix)
+        self.reporter.post(*metric)
+        row['qps'] = metric[0]
+        row['snapshot'] = metric[1][0] if metric[1] else ''
+        return row
+
+    def log_scan_summary(self, rows: list[dict]):
+        """Log the whole sweep as one table, so the curve is readable in one place."""
+        if not rows:
+            return
+
+        percentiles = [f"p{p:g}" for p in self.test_config.access_settings.latency_percentiles]
+        columns = ['point', 'recall', 'accuracy', 'qps'] + percentiles + ['snapshot']
+        widths = {'point': 22, 'recall': 9, 'accuracy': 9, 'qps': 9, 'snapshot': 36}
+
+        def render(values: dict) -> str:
+            return '  '.join(f"{values[c]:<{widths.get(c, 9)}}" for c in columns).rstrip()
+
+        lines = [render({c: c for c in columns})]
+        for row in rows:
+            values = {c: f"{row.get(c, 0):.1f}" for c in ['recall', 'accuracy'] + percentiles}
+            values.update(point=row['point'].label, qps=f"{row['qps']:.0f}",
+                          snapshot=row['snapshot'])
+            lines.append(render(values))
+
+        logger.info("Vector scan sweep (recall/QPS curve):\n" + '\n'.join(lines))
 
     def run(self):
         self.cloud_restore()
@@ -2260,11 +2335,26 @@ class N1qlVectorLatencyThroughputPreparedStatementTest(N1qlVectorSearchTest):
         self.create_indexes(statements=statements)
         self.wait_for_indexing(statements=statements)
         self.downloads_ground_truth_file()
-        probes, recalls, accuracies = self.vector_recall_and_accuracy_check()
+        points, recalls, accuracies = self.vector_recall_and_accuracy_check()
+        if not points:
+            logger.interrupt("No vector scan points to run: set vector_scan_probes in the "
+                             ".test file, as a list of nprobes[:rerank[:topNScan]]")
         self.enable_stats()
-        initial_throughput = self.metrics._avg_n1ql_throughput(self.master_node)
-        self.access()
-        self.report_kpi(probes, recalls, accuracies, initial_throughput)
+
+        rows = []
+        for i, (point, recall, accuracy) in enumerate(zip(points, recalls, accuracies)):
+            logger.info(f"Running scan phase {i + 1}/{len(points)} at {point.knobs}")
+            # Query request counts are cumulative, so each phase's throughput is the
+            # difference across it.
+            initial_throughput = self.metrics._avg_n1ql_throughput(self.master_node)
+            self.access(point)
+            # The first point keeps the unsuffixed metric ids, so a test that sweeps
+            # continues the showfast series it reported when it scanned a single point.
+            metric_id_suffix = "" if i == 0 else f"_probes{point.label}"
+            rows.append(self.report_scan_point_kpi(point, recall, accuracy, initial_throughput,
+                                                   metric_id_suffix))
+
+        self.log_scan_summary(rows)
 
 
 class CapellaSnapshotBackupWithN1QLTest(CapellaSnapshotBackupRestoreTest, N1QLTest):
@@ -2417,13 +2507,13 @@ class N1QLDynamicServiceRebalanceTest(N1QLThroughputRebalanceTest, DynamicServic
 class N1qlVectorLatencyThroughputTestWithBgOps(
     N1qlVectorLatencyThroughputPreparedStatementTest):
 
-    def access(self):
+    def access(self, point: Optional[VectorScanPoint] = None):
         access_settings = self.test_config.access_settings
         access_settings.n1ql_workers = 0
         access_settings.vector_query_map = self.test_config.index_settings.vector_query_map
         PerfTest.access_bg(self, settings=access_settings)
         time.sleep(60) # to start background workload
-        super().access()
+        super().access(point)
 
 
 class N1qlVectorLatencyRebalanceTest(N1qlVectorLatencyThroughputPreparedStatementTest,
@@ -2461,9 +2551,9 @@ class N1qlVectorLatencyRebalanceTest(N1qlVectorLatencyThroughputPreparedStatemen
         return total_requests_during_rebalance
 
     def recall_pre_rebalance(self):
-        probes, recalls, accuracies = self.vector_recall_and_accuracy_check()
+        points, recalls, accuracies = self.vector_recall_and_accuracy_check()
         logger.info("Recall and accuracy check before rebalance completed.")
-        logger.info(f"Probes: {probes}, Recalls: {recalls}, Accuracies: {accuracies}")
+        logger.info(f"Points: {points}, Recalls: {recalls}, Accuracies: {accuracies}")
 
     def access_n1ql_bg(self, *args):
         access_settings = self.test_config.access_settings
@@ -2473,8 +2563,8 @@ class N1qlVectorLatencyRebalanceTest(N1qlVectorLatencyThroughputPreparedStatemen
         iterator = TargetIterator(self.cluster_spec, self.test_config, 'n1ql')
         PerfTest.access_bg(self, settings=access_settings, target_iterator=iterator)
 
-    def _report_kpi(self, probes, recalls, accuracies, total_requests):
-        self.report_recall_and_accuracy(probes, recalls, accuracies)
+    def _report_kpi(self, points, recalls, accuracies, total_requests):
+        self.report_recall_and_accuracy(points, recalls, accuracies)
         self.reporter.post(*self.metrics.rebalance_time(self.rebalance_time))
         self.reporter.post(
             *self.metrics.avg_n1ql_rebalance_throughput(self.rebalance_time, total_requests)
@@ -2489,5 +2579,5 @@ class N1qlVectorLatencyRebalanceTest(N1qlVectorLatencyThroughputPreparedStatemen
         self.recall_pre_rebalance()
         self.access_bg()
         total_requests_during_rebalance = self.rebalance_indexer()
-        probes, recalls, accuracies = self.vector_recall_and_accuracy_check()
-        self._report_kpi(probes, recalls, accuracies, total_requests_during_rebalance)
+        points, recalls, accuracies = self.vector_recall_and_accuracy_check()
+        self._report_kpi(points, recalls, accuracies, total_requests_during_rebalance)

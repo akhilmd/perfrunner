@@ -266,9 +266,14 @@ class MetricHelper:
 
     def avg_n1ql_throughput(self, master_node: str, initial_throughput: str = None,
                             custom_title_postfix: str = None,
-                            update_subcategory: bool = False) -> Metric:
-        """Generate cluster total query throughput metric."""
-        metric_id = f"{self.test_config.name}_avg_query_requests"
+                            update_subcategory: bool = False,
+                            metric_id_suffix: str = "") -> Metric:
+        """Generate cluster total query throughput metric.
+
+        ``metric_id_suffix`` separates the ids of tests that report one KPI per workload
+        phase (e.g. a vector scan sweep); an empty suffix keeps the single-phase id.
+        """
+        metric_id = f"{self.test_config.name}{metric_id_suffix}_avg_query_requests"
         title = f"Avg. Query Throughput (queries/sec), {self._title}"
         if custom_title_postfix:
             title = f"{title} {custom_title_postfix}"
@@ -943,8 +948,14 @@ class MetricHelper:
 
     def query_latency(self, percentile: Number, cluster_idx: int = 0,
                       custom_title_postfix: str = None,
-                      update_subcategory: bool = False) -> Metric:
-        metric_id = f"{self.test_config.name}_query_{percentile:g}th"
+                      update_subcategory: bool = False,
+                      metric_id_suffix: str = "") -> Metric:
+        """Generate a query latency percentile metric.
+
+        ``metric_id_suffix`` separates the ids of tests that report one KPI per workload
+        phase (e.g. a vector scan sweep); an empty suffix keeps the single-phase id.
+        """
+        metric_id = f"{self.test_config.name}{metric_id_suffix}_query_{percentile:g}th"
         metric_id = metric_id.replace('.', '')
 
         title_prefix = f"{percentile:g}th percentile query latency (ms)"

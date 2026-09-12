@@ -2654,8 +2654,8 @@ class VectorSecondaryIndexingScanAndRecallTest(VectorSecondaryIndexingScanTest):
 
     def run(self):
         super().run()
-        probes, recalls, accuracies = self.calculate_recall()
-        N1qlVectorSearchTest.report_kpi(self, probes, recalls, accuracies)
+        points, recalls, accuracies = self.calculate_recall()
+        N1qlVectorSearchTest.report_kpi(self, points, recalls, accuracies)
 
 
 class CloudVectorSecondaryIndexingScanTest(VectorSecondaryIndexingScanAndRecallTest):
